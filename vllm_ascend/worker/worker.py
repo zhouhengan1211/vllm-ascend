@@ -182,6 +182,27 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+        # profile采集
+        import os
+        import torch_npu
+        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
+            # Initialize profiler
+            import torch_npu
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            )
+            self.profiler_npu = torch_npu.profiler.profile(
+                activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+                with_modules=False,  # 采集调用栈
+                profile_memory=os.environ.get('WITH_MEMORY', "false") == "true",  # 采集内存
+                record_shapes=os.environ.get('WITH_SHAPE', "false") == "true",
+                with_stack=os.environ.get('WITH_STACK', "false") == "true",
+                experimental_config=experimental_config,
+                # 跳过第一步，warmup一步，采集3步，重复1次。如果想采集第30~70个decode step，可以设置为schedule=torch_npu.profiler.schedule(wait=29, warmup=1, active=30, repeat=1)
+                schedule=torch_npu.profiler.schedule(wait=29, warmup=1, active=30, repeat=1),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.environ.get('ROLLOUT_PROFILE_PATH'), analyse_flag=True)  # 采集数据保存路径，是否在线解析
+            )
+            self.profiler_npu.start()
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -652,6 +673,11 @@ class NPUWorker(WorkerBase):
             self.profiler.step()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+
+        import os
+        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
+            self.profiler_npu.step()  # 驱动 schedule，对部分decode step进行采集
+            
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
