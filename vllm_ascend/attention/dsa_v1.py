@@ -1648,9 +1648,13 @@ class AscendDSAImpl(DSAAttentionImpl):
             o_proj_input = self.wo_a(o_proj_input)
             output[...] = self.wo_b(o_proj_input)
         else:
+            wo_a_weight = (
+               self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1).transpose(1, 2).contiguous()
+            )
             o_proj_input = torch_npu.npu_transpose_batchmatmul(
                 o_proj_input,
-                self.wo_a.weight,
+                # self.wo_a.weight,
+                wo_a_weight,
                 bias=None,
                 scale=None,
                 perm_x1=(1, 0, 2),

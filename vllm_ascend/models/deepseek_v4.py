@@ -1357,6 +1357,52 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if not name.startswith("model"):
                 name = f"model.{name}"
 
+            # FSDP/Transformers and vLLM use different names for the
+            # native DeepSeek V4 MLA/DSA parameters. Weight synchronization
+            # sends the former names, so normalize them before params_dict
+            # lookup.
+            name = name.replace(".self_attn.q_a_proj.", ".self_attn.wq_a.")
+            name = name.replace(".self_attn.kv_proj.", ".self_attn.wkv.")
+            name = name.replace(".self_attn.q_b_proj.", ".self_attn.wq_b.")
+            name = name.replace(".self_attn.o_a_proj.", ".self_attn.wo_a.")
+            name = name.replace(".self_attn.o_b_proj.", ".self_attn.wo_b.")
+            name = name.replace(".self_attn.q_a_norm.", ".self_attn.q_norm.")
+            name = name.replace(".self_attn.sinks", ".self_attn.attn_sink")
+            name = name.replace(".self_attn.compressor.kv_proj.", ".self_attn.compressor.wkv.")
+            name = name.replace(".self_attn.compressor.gate_proj.", ".self_attn.compressor.wgate.")
+            name = name.replace(".self_attn.compressor.kv_norm.", ".self_attn.compressor.norm.")
+            name = name.replace(".self_attn.compressor.position_bias", ".self_attn.compressor.ape")
+            name = name.replace(
+                ".self_attn.compressor.indexer.position_bias",
+                ".self_attn.indexer.compressor.ape",
+            )
+            name = name.replace(
+                ".self_attn.compressor.indexer.kv_proj.",
+                ".self_attn.indexer.compressor.wkv.",
+            )
+            name = name.replace(
+                ".self_attn.compressor.indexer.gate_proj.",
+                ".self_attn.indexer.compressor.wgate.",
+            )
+            name = name.replace(
+                ".self_attn.compressor.indexer.q_b_proj.",
+                ".self_attn.indexer.wq_b.",
+            )
+            name = name.replace(
+                ".self_attn.compressor.indexer.kv_norm.",
+                ".self_attn.indexer.compressor.norm.",
+            )
+            name = name.replace(".self_attn.compressor.indexer.", ".self_attn.indexer.")
+            name = name.replace("model.hc_head.hc_fn", "model.hc_head_fn")
+            name = name.replace("model.hc_head.hc_base", "model.hc_head_base")
+            name = name.replace("model.hc_head.hc_scale", "model.hc_head_scale")
+            name = name.replace(".attn_hc.fn", ".hc_attn_fn")
+            name = name.replace(".attn_hc.base", ".hc_attn_base")
+            name = name.replace(".attn_hc.scale", ".hc_attn_scale")
+            name = name.replace(".ffn_hc.fn", ".hc_ffn_fn")
+            name = name.replace(".ffn_hc.base", ".hc_ffn_base")
+            name = name.replace(".ffn_hc.scale", ".hc_ffn_scale")
+
             if ".w1." in name:
                 name = name.replace(".w1.", ".gate_proj.")
             if ".w2." in name:
@@ -1495,10 +1541,29 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                             continue
 
                         param = params_dict[name_mapped]
+                        # FusedMoE's unquantized parameters in vLLM 0.23.0
+                        # are plain torch.nn.Parameter objects. The loader is
+                        # passed as an attribute during normal construction,
+                        # but some DeepSeek V4/Ascend construction paths do
+                        # not preserve that attribute. The authoritative
+                        # loader is always the owning FusedMoE module, so use
+                        # it as a fallback instead of dereferencing a missing
+                        # parameter attribute.
+                        weight_loader = getattr(param, "weight_loader", None)
+                        if weight_loader is None:
+                            owner_name = name_mapped.rsplit(".", 1)[0]
+                            owner = self.get_submodule(owner_name)
+                            weight_loader = getattr(owner, "weight_loader", None)
+                        if weight_loader is None:
+                            raise AttributeError(
+                                "DeepSeek V4 expert parameter has no weight loader: "
+                                f"source={chunk_name}, target={name_mapped}, "
+                                f"shape={tuple(param.shape)}, type={type(param).__name__}"
+                            )
+                        weight_loader = typing.cast(Callable[..., bool], weight_loader)
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # other available replicas.
-                        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
                         success = weight_loader(
                             param,
                             weight_to_load,
