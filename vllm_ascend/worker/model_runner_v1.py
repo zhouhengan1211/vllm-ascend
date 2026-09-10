@@ -346,6 +346,15 @@ class NPUModelRunner(GPUModelRunner):
                 from msprobe.pytorch import PrecisionDebugger
 
                 self.debugger = PrecisionDebugger(dump_cfg)
+                import os
+                from vllm_ascend.worker.dispatch_logger import DispatchLogger
+                self.debugger.service.config.dump_path = os.path.join(
+                    self.debugger.config.dump_path, f'{os.getpid()}')
+                self._dispatch_logger = DispatchLogger(
+                    dump_path=self.debugger.config.dump_path,
+                    pid=os.getpid(),
+                    rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                )
             else:
                 try:
                     from msprobe.pytorch import AclGraphDumper
@@ -356,6 +365,8 @@ class NPUModelRunner(GPUModelRunner):
                     ) from exc
 
                 self.debugger = AclGraphDumper(dump_cfg)
+        if not hasattr(self, "_dispatch_logger") or self._dispatch_logger is None:
+            self._dispatch_logger = None
         # use_hybrid_blocks: if hybrid blocks is used.
         self.use_hybrid_blocks: bool = False
         self.need_accepted_tokens: bool = False
@@ -2054,6 +2065,10 @@ class NPUModelRunner(GPUModelRunner):
                         encoder_cache=self.encoder_cache,
                     ) as ec_connector_output:
                         self._execute_mm_encoder(scheduler_output)
+
+                        if self._dispatch_logger is not None and not self.debugger.service.should_stop_service:
+                            self._dispatch_logger.log_step(scheduler_output, self.attn_state)
+                            
                         self._finalize_dump_data()
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
